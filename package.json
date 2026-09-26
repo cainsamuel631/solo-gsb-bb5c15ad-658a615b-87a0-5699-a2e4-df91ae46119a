@@ -1,0 +1,19 @@
+{
+  "name": "range-plan-api",
+  "version": "1.0.0",
+  "description": "HTTP byte-range response planning API (RFC 9110) built with Fastify and range-parser",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "ajv": "^8.20.0",
+    "fastify": "^5.0.0",
+    "range-parser": "^1.2.1"
+  }
+}

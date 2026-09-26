@@ -1,0 +1,21 @@
+services:
+  range-plan:
+    build: .
+    image: range-plan-api:latest
+    container_name: range-plan-api
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # All values below are optional; these are the built-in defaults.
+      HOST: "0.0.0.0"
+      PORT: "3000"
+      MAX_SEGMENTS: "16"
+      TRANSFER_SIZE_RATIO: "2"
+      # LOG_LEVEL: "info"   # uncomment to enable request logging
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
