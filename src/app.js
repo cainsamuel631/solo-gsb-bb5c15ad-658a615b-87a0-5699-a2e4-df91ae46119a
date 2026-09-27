@@ -10,6 +10,12 @@ import {
   MAX_COMPLETED_INTERVALS,
   MAX_RESUME_REQUESTS,
 } from './resume.js';
+import {
+  checkMultipartMessage,
+  MAX_EXPECTED_INTERVALS,
+  MAX_BODY_BASE64_LENGTH,
+  MAX_CONTENT_TYPE_LENGTH,
+} from './multipart-check.js';
 import { ENTITY_TAG_RE, parseHttpDate } from './conditional.js';
 
 const MEDIA_TYPE_RE =
@@ -53,6 +59,32 @@ const resumePlanBodySchema = {
   },
 };
 
+const expectedIntervalSchema = {
+  type: 'object',
+  required: ['start', 'end'],
+  additionalProperties: false,
+  properties: {
+    start: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    end: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+  },
+};
+
+const multipartCheckBodySchema = {
+  type: 'object',
+  required: ['size', 'expected', 'contentType', 'bodyBase64'],
+  additionalProperties: false,
+  properties: {
+    size: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    expected: {
+      type: 'array',
+      maxItems: MAX_EXPECTED_INTERVALS,
+      items: expectedIntervalSchema,
+    },
+    contentType: { type: 'string', minLength: 1, maxLength: MAX_CONTENT_TYPE_LENGTH },
+    bodyBase64: { type: 'string', minLength: 1, maxLength: MAX_BODY_BASE64_LENGTH },
+  },
+};
+
 // Resume planning demands strict types: Fastify's default ajv setup coerces
 // scalar types and silently strips unknown properties, which would let a
 // string like "1000" pass as a byte count. This route therefore validates
@@ -72,6 +104,9 @@ export function buildApp(config = {}) {
   const app = Fastify({
     logger: config.logger ?? false,
     trustProxy: true,
+    // The largest JSON body /multipart-check accepts is roughly 1.4 MiB of
+    // base64; keep the framework ceiling above the 1 MiB decoded-message rule.
+    bodyLimit: 2 * 1024 * 1024,
   });
 
   const maxSegments = config.maxSegments ?? DEFAULT_MAX_SEGMENTS;
@@ -138,6 +173,20 @@ export function buildApp(config = {}) {
         limit: request.body.limit,
       });
 
+      return reply.status(result.statusCode).send(result);
+    },
+  );
+
+  // Verify a raw multipart/byteranges response body against the resource size
+  // and the ranges the client expected to receive.
+  app.post(
+    '/multipart-check',
+    {
+      schema: { body: multipartCheckBodySchema },
+      validatorCompiler: strictBodyValidatorCompiler,
+    },
+    async (request, reply) => {
+      const result = checkMultipartMessage(request.body);
       return reply.status(result.statusCode).send(result);
     },
   );

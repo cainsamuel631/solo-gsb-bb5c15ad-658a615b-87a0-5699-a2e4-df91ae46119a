@@ -10,6 +10,9 @@ API，遵循 [RFC 9110 §14](https://www.rfc-editor.org/rfc/rfc9110.html#section
 另提供 `POST /resume-plan` 断点续传缺口规划接口：上报已持久化的字节区间，
 返回还需请求的 Range 分片清单（见下文）。
 
+`POST /multipart-check` 则用于**核验**真实的 `multipart/byteranges` 响应
+报文：传入资源大小、期望区间与原始报文，返回实收、缺失、预期外的字节区间。
+
 ## 单条启动命令
 
 ```bash
@@ -192,6 +195,75 @@ curl -X POST http://localhost:3000/resume-plan \
 `[{"start":40,"end":59},{"start":10,"end":19},{"start":30,"end":49},{"start":0,"end":9}]`
 会归并为 `[0,19]` 与 `[30,59]` 再计算缺口。
 
+### `POST /multipart-check`（multipart/byteranges 报文核验）
+
+核验一份真实的 `multipart/byteranges` 响应报文是否结构合法，并对照客户端
+**期望收到**的区间核算字节：实收区间（归并）、期望但未收的区间、预期外的
+区间。典型用途是校验下载客户端/代理拼出的分片报文。
+
+请求体：
+
+| 字段          | 类型    | 必填 | 说明                                                         |
+| ------------- | ------- | ---- | ------------------------------------------------------------ |
+| `size`        | integer | 是   | 资源总字节数，非负安全整数（`size ≥ 0`）                     |
+| `expected`    | array   | 是   | 期望区间数组（≤ 16 项），每项 `{"start":…,"end":…}` 为**闭区间**，须满足 `0 ≤ start ≤ end < size`；可乱序、重叠、相邻 |
+| `contentType` | string  | 是   | 报文的媒体类型，必须是 `multipart/byteranges` 且带一个 `boundary` 参数（可加引号，如 `boundary="abc-1"`）；boundary 为 1～70 位字母数字或连字符 |
+| `bodyBase64`  | string  | 是   | 原始报文的标准 base64 编码（含规范 `=` 填充）；解码后 **≤ 1 MiB** |
+
+报文必须严格采用规范封装：全部以 **CRLF** 分隔，**无前言（preamble）、无
+尾声（epilogue）**，以 `--boundary` 开头、以 `--boundary--` 加 CRLF 收尾；
+每段含**唯一一个** `Content-Range` 头（形如 `bytes 0-99/1000`，总大小须等于
+`size`，端点须落在资源内），段数据长度必须等于 `end-start+1`；各段的
+Content-Range 不得重复；段数 ≤ 16。数据中即使出现与边界相似的字节序列，
+只要不构成合法的边界分隔行（前导 CRLF + `--boundary` + CRLF/`--`），就不会
+截断分段。
+
+任何非法输入（类型/数值不合法、多余字段）或非法结构都返回 `400`（如
+`INVALID_BOUNDARY`、`MALFORMED_MULTIPART`、`MISSING_CONTENT_RANGE`、
+`DUPLICATE_CONTENT_RANGE`、`PART_BYTE_LENGTH_MISMATCH`、`MESSAGE_TOO_LARGE`
+等）。
+
+响应（`200`）：
+
+| 字段       | 说明                                                         |
+| ---------- | ------------------------------------------------------------ |
+| `received` | 归并后的实收区间（重叠/相邻合并），按起点升序                |
+| `missing`  | 期望但未收的区间（`expected − received`），归并后按起点升序  |
+| `extra`    | 预期外字节区间（`received − expected`），归并后按起点升序    |
+| `complete` | `missing` 与 `extra` 均为空时为 `true`                       |
+
+示例（实收两段合并覆盖 `0-49`，`30-59` 中有 10 字节属于预期外）：
+
+```bash
+python3 - <<'PY'
+import base64, json, urllib.request
+CRLF = "\r\n"
+boundary = "bnd-123"
+def part(start, end, size, data):
+    return f"--{boundary}{CRLF}Content-Range: bytes {start}-{end}/{size}{CRLF}{CRLF}" + data + CRLF
+body = (part(0, 29, 100, "a"*30) + part(30, 59, 100, "b"*30) + f"--{boundary}--{CRLF}").encode()
+payload = {"size": 100, "expected": [{"start": 0, "end": 49}],
+           "contentType": f"multipart/byteranges; boundary={boundary}",
+           "bodyBase64": base64.b64encode(body).decode()}
+req = urllib.request.Request("http://localhost:3000/multipart-check",
+                             data=json.dumps(payload).encode(),
+                             headers={"Content-Type": "application/json"})
+print(urllib.request.urlopen(req).read().decode())
+PY
+```
+
+响应：
+
+```json
+{
+  "statusCode": 200,
+  "received": [{ "start": 0, "end": 59 }],
+  "missing": [],
+  "extra": [{ "start": 50, "end": 59 }],
+  "complete": false
+}
+```
+
 ## 响应语义
 
 每个规划结果带 `decision` 字段：
@@ -309,23 +381,25 @@ PORT=8080 docker compose up --build -d   # 或编辑 compose 中的 ports 映射
 
 ```
 src/
-  conditional.js # If-Range 评估：强 ETag 逐字比较、严格 HTTP-date 解析（IMF-fixdate/RFC 850/asctime）
-  planner.js     # 范围规划核心：解析、夹取、丢弃、合并、边界生成、422 守卫、条件降级
-  resume.js      # 断点续传缺口规划：区间归并、缺口计算、按 chunkBytes/limit 拆分
-  app.js         # Fastify 应用：POST/GET /plan、POST /resume-plan、/healthz、输入校验
-  server.js      # 启动入口与环境变量读取
+  conditional.js    # If-Range 评估：强 ETag 逐字比较、严格 HTTP-date 解析（IMF-fixdate/RFC 850/asctime）
+  planner.js        # 范围规划核心：解析、夹取、丢弃、合并、边界生成、422 守卫、条件降级
+  resume.js         # 断点续传缺口规划：区间归并、缺口计算、按 chunkBytes/limit 拆分
+  multipart-check.js # multipart/byteranges 报文核验：boundary 解析、严格分段、Content-Range 核算、区间归并/差集
+  app.js            # Fastify 应用：POST/GET /plan、POST /resume-plan、POST /multipart-check、/healthz、输入校验
+  server.js         # 启动入口与环境变量读取
 test/
-  planner.test.js  # 原有 node:test 用例（26 个）
-  if-range.test.js # If-Range ETag/日期（含旧式日期格式）/降级/元数据校验用例（34 个）
-  headers.test.js  # 真实 socket 上的重复头与 CR/LF 拒绝用例（4 个）
-  resume.test.js   # 断点续传缺口规划用例（24 个）
+  planner.test.js       # 原有 node:test 用例（26 个）
+  if-range.test.js      # If-Range ETag/日期（含旧式日期格式）/降级/元数据校验用例（34 个）
+  headers.test.js       # 真实 socket 上的重复头与 CR/LF 拒绝用例（4 个）
+  resume.test.js        # 断点续传缺口规划用例（24 个）
+  multipart-check.test.js # multipart/byteranges 核验用例（32 个）
 ```
 
 ## 本地开发与测试
 
 ```bash
 npm ci
-npm test          # 88 个用例：区间解析/合并/416/422/边界 + If-Range ETag/三种 HTTP-date/降级 + 重复头/CRLF + 续传缺口规划
+npm test          # 120 个用例：区间解析/合并/416/422/边界 + If-Range ETag/三种 HTTP-date/降级 + 重复头/CRLF + 续传缺口规划 + multipart 核验
 npm start
 ```
 
@@ -346,3 +420,9 @@ npm start
 - `/resume-plan` 使用独立的严格校验器：关闭类型强转与属性剔除，字符串数字、
   小数、多余字段一律 `400`；区间必须满足 `0 ≤ start ≤ end < size`，
   `completed` 上限 10000 项、`limit` 上限 10000 条，防止超大输入耗尽资源。
+- `/multipart-check` 同样使用严格校验器：所有数值必须是安全整数，
+  `expected` 与分段各上限 16 项，多余字段一律 `400`；报文仅接受标准 base64
+  且解码后不超过 1 MiB（框架请求体上限 2 MiB）；boundary 限定为 1～70 位
+  字母数字或连字符、不允许 CR/LF，杜绝边界注入；报文必须 CRLF 分隔、无前言
+  尾声、闭合边界，段头仅接受合法 token 字段名与字段值，Content-Range 唯一、
+  总大小与 `size` 一致、段数据长度与声明一致；数据中的伪边界序列不会截断分段。
