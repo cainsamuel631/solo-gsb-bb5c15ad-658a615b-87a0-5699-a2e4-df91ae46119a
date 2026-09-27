@@ -10,6 +10,11 @@ import {
   MAX_COMPLETED_INTERVALS,
   MAX_RESUME_REQUESTS,
 } from './resume.js';
+import {
+  checkMultipart,
+  MAX_CHECK_SEGMENTS,
+  MAX_BASE64_CHARS,
+} from './multipart-check.js';
 import { ENTITY_TAG_RE, parseHttpDate } from './conditional.js';
 
 const MEDIA_TYPE_RE =
@@ -53,6 +58,32 @@ const resumePlanBodySchema = {
   },
 };
 
+const expectedIntervalSchema = {
+  type: 'object',
+  required: ['start', 'end'],
+  additionalProperties: false,
+  properties: {
+    start: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    end: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+  },
+};
+
+const multipartCheckBodySchema = {
+  type: 'object',
+  required: ['size', 'expected', 'contentType', 'bodyBase64'],
+  additionalProperties: false,
+  properties: {
+    size: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    expected: {
+      type: 'array',
+      maxItems: MAX_CHECK_SEGMENTS,
+      items: expectedIntervalSchema,
+    },
+    contentType: { type: 'string', minLength: 1, maxLength: 512 },
+    bodyBase64: { type: 'string', minLength: 1, maxLength: MAX_BASE64_CHARS },
+  },
+};
+
 // Resume planning demands strict types: Fastify's default ajv setup coerces
 // scalar types and silently strips unknown properties, which would let a
 // string like "1000" pass as a byte count. This route therefore validates
@@ -67,17 +98,31 @@ const strictBodyValidatorCompiler = ({ schema }) => strictBodyAjv.compile(schema
 
 const MAX_HEADER_LENGTH = 4096;
 const MAX_METADATA_LENGTH = { etag: 1024, lastModified: 255 };
+// The wire message may be 1 MiB decoded; its JSON envelope (base64 + framing)
+// is therefore allowed up to 2 MiB.
+const MAX_JSON_BODY_BYTES = 2 * 1024 * 1024;
 
 export function buildApp(config = {}) {
   const app = Fastify({
     logger: config.logger ?? false,
     trustProxy: true,
+    bodyLimit: MAX_JSON_BODY_BYTES,
   });
 
   const maxSegments = config.maxSegments ?? DEFAULT_MAX_SEGMENTS;
   const transferSizeRatio = config.transferSizeRatio ?? DEFAULT_TRANSFER_SIZE_RATIO;
 
   app.setErrorHandler((error, _request, reply) => {
+    // Oversized JSON envelopes are bad input for this API, not a server
+    // capacity problem: report them as a uniform 400.
+    if (error.statusCode === 413) {
+      return reply.status(400).send({
+        statusCode: 400,
+        code: 'BODY_TOO_LARGE',
+        error: 'Bad Request',
+        message: error.message,
+      });
+    }
     const statusCode = error.statusCode ?? 500;
     reply.status(statusCode).send({
       statusCode,
@@ -136,6 +181,27 @@ export function buildApp(config = {}) {
         completed: request.body.completed,
         chunkBytes: request.body.chunkBytes,
         limit: request.body.limit,
+      });
+
+      return reply.status(result.statusCode).send(result);
+    },
+  );
+
+  // multipart/byteranges verification: POST /multipart-check with the declared
+  // size, expected intervals, part media type (carrying the boundary) and the
+  // raw wire message base64-encoded in the JSON body.
+  app.post(
+    '/multipart-check',
+    {
+      schema: { body: multipartCheckBodySchema },
+      validatorCompiler: strictBodyValidatorCompiler,
+    },
+    async (request, reply) => {
+      const result = checkMultipart({
+        size: request.body.size,
+        expected: request.body.expected,
+        contentType: request.body.contentType,
+        bodyBase64: request.body.bodyBase64,
       });
 
       return reply.status(result.statusCode).send(result);
